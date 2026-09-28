@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -23,6 +24,29 @@ const (
 	timeThreshold = 9.0 / 8
 	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
 	packetThreshold = 3
+	// Some paths reorder packets to a much higher degree than others. On such paths, a
+	// fixed packet threshold causes packets that are merely reordered to be declared
+	// lost and retransmitted, wasting bandwidth. Following RFC 9002 section 6.1.1,
+	// the threshold used for the application data packet number space therefore adapts
+	// to the observed reordering. It starts at packetThreshold and is bounded by
+	// maxReorderThreshold.
+	maxReorderThreshold = 384
+	// The lost packet tracker records recently lost packets so that spurious
+	// losses can be recognized when they are acknowledged later. Its capacity
+	// must hold at least one RTT worth of lost packets: at high packet rates a
+	// smaller capacity evicts entries before their acknowledgments arrive,
+	// hiding reordering evidence from the adaptive threshold and from
+	// congestion controllers implementing SpuriousLossObserver.
+	lostPacketTrackerCapacity = 1024
+	// Factor applied to an observed reordering extent when it raises the adaptive
+	// threshold, leaving headroom so that reordering of the same extent no longer
+	// declares packets lost.
+	reorderThresholdIncreaseFactor = 1.25
+	// Factor applied to the adaptive threshold on every decay step.
+	reorderThresholdDecayFactor = 0.75
+	// The adaptive threshold starts decaying after this multiple of the smoothed RTT
+	// has passed without any significant reordering being observed.
+	reorderThresholdIdleRTTs = 4
 	// Before validating the client's address, the server won't send more than 3x bytes than it received.
 	amplificationFactor = 3
 	// We use Retry packets to derive an RTT estimate. Make sure we don't set the RTT to a super low value yet.
@@ -79,6 +103,14 @@ type sentPacketHandler struct {
 	lostPackets      lostPacketTracker // only for application-data packet number space
 	// send time of the largest acknowledged packet, across all packet number spaces
 	largestAckedTime monotime.Time
+
+	// Adaptive packet reordering threshold for the application data packet number
+	// space, see RFC 9002 section 6.1.1. It starts at packetThreshold and is raised
+	// when the path exhibits a higher degree of reordering, so that reordered
+	// packets are not spuriously declared lost.
+	reorderThreshold  float64
+	lastReorderSignal monotime.Time
+	lastReorderDecay  monotime.Time
 
 	// Do we know that the peer completed address validation yet?
 	// Always true for the server.
@@ -167,7 +199,8 @@ func NewSentPacketHandler(
 		initialPackets:                 newPacketNumberSpace(initialPN, false),
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
-		lostPackets:                    *newLostPacketTracker(64),
+		lostPackets:                    *newLostPacketTracker(lostPacketTrackerCapacity),
+		reorderThreshold:               packetThreshold,
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     congestion,
@@ -487,12 +520,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
 	}
 
+	if encLevel == protocol.Encryption1RTT {
+		h.decayReorderThreshold(rcvTime)
+	}
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
-		h.detectSpuriousLosses(
-			ack,
-			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
-		)
+		h.detectSpuriousLosses(ack, rcvTime)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
@@ -522,7 +555,10 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, rcvTime monotime.Time) {
+	// The send time of a spuriously lost packet is estimated by correcting the
+	// ACK receive time with the ACK delay claimed by the peer.
+	ackTime := rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay()))
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
@@ -560,6 +596,68 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
 	}
+	if maxPacketReordering >= packetThreshold {
+		h.updateReorderThreshold(maxPacketReordering, rcvTime)
+	}
+	if count := len(spuriousLosses); count > 0 {
+		if sn, ok := h.getCongestionControl().(spuriousLossObserver); ok {
+			sn.OnSpuriousLoss(count)
+		}
+	}
+}
+
+// spuriousLossObserver is implemented by congestion controllers that want to be
+// notified about spurious losses, see congestion.SpuriousLossObserver.
+type spuriousLossObserver interface {
+	OnSpuriousLoss(count int)
+}
+
+// updateReorderThreshold raises the adaptive reordering threshold of the
+// application data packet number space, see RFC 9002 section 6.1.1: paths that
+// reorder packets to a higher degree than the current threshold would keep
+// causing packets to be spuriously declared lost, so the threshold is raised to
+// a level above the observed reordering extent. Only confirmed spurious losses
+// are used as a signal: a packet that was declared lost and is acknowledged
+// later is proof that the path reordered by at least that extent.
+func (h *sentPacketHandler) updateReorderThreshold(reordering protocol.PacketNumber, now monotime.Time) {
+	h.lastReorderSignal = now
+	newThreshold := float64(reordering) * reorderThresholdIncreaseFactor
+	if newThreshold > h.reorderThreshold {
+		old := h.reorderThreshold
+		h.reorderThreshold = min(newThreshold, maxReorderThreshold)
+		if h.logger.Debug() {
+			h.logger.Debugf("\tincrease reordering threshold to %.1f (observed reordering: %d packets)", h.reorderThreshold, reordering)
+		}
+		if h.qlogger != nil {
+			h.qlogger.RecordEvent(qlog.ReorderThresholdUpdated{Old: old, New: h.reorderThreshold})
+		}
+	}
+}
+
+// decayReorderThreshold slowly decays the adaptive reordering threshold back to
+// packetThreshold once the path hasn't exhibited significant reordering for a
+// while, so that loss detection on paths that stopped reordering returns to the
+// default sensitivity.
+func (h *sentPacketHandler) decayReorderThreshold(now monotime.Time) {
+	if h.reorderThreshold <= packetThreshold || !h.rttStats.HasMeasurement() {
+		return
+	}
+	rtt := h.rttStats.SmoothedRTT()
+	if now.Sub(h.lastReorderSignal) < time.Duration(reorderThresholdIdleRTTs)*rtt {
+		return
+	}
+	if now.Sub(h.lastReorderDecay) < rtt {
+		return
+	}
+	h.lastReorderDecay = now
+	newThreshold := max(packetThreshold, h.reorderThreshold*reorderThresholdDecayFactor)
+	if h.logger.Debug() {
+		h.logger.Debugf("\tdecay reordering threshold from %.1f to %.1f", h.reorderThreshold, newThreshold)
+	}
+	if h.qlogger != nil {
+		h.qlogger.RecordEvent(qlog.ReorderThresholdUpdated{Old: h.reorderThreshold, New: newThreshold})
+	}
+	h.reorderThreshold = newThreshold
 }
 
 // Packets are returned in ascending packet number order.
@@ -838,6 +936,13 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
 
+	// The application data packet number space uses an adaptive reordering
+	// threshold (see updateReorderThreshold), all other spaces use the fixed one.
+	reorderLimit := protocol.PacketNumber(packetThreshold)
+	if encLevel == protocol.Encryption1RTT {
+		reorderLimit = protocol.PacketNumber(math.Ceil(h.reorderThreshold))
+	}
+
 	cc := h.getCongestionControl()
 
 	priorInFlight := h.bytesInFlight
@@ -863,7 +968,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= reorderLimit {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {
@@ -1198,6 +1303,11 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
+	// The new path might exhibit completely different reordering characteristics,
+	// so reset the adaptive reordering threshold.
+	h.reorderThreshold = packetThreshold
+	h.lastReorderSignal = 0
+	h.lastReorderDecay = 0
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
 		if !p.isPathProbePacket {

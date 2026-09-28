@@ -54,6 +54,16 @@ type CongestionControlEx interface {
 	OnCongestionEventEx(priorInFlight ByteCount, eventTime monotime.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
 }
 
+// SpuriousLossObserver is an optional interface that congestion controllers can
+// implement to be notified about losses that turned out to be spurious: packets
+// that were declared lost (and possibly retransmitted) but were acknowledged by
+// the peer afterwards, e.g. because they were only reordered on the path.
+// Congestion controllers that treat loss as a signal can use this notification
+// to retract the effect of those losses.
+type SpuriousLossObserver interface {
+	OnSpuriousLoss(count int)
+}
+
 type RTTStatsProvider interface {
 	MinRTT() time.Duration
 	LatestRTT() time.Duration

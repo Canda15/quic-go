@@ -1691,7 +1691,10 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, []protocol.PacketNumber{pns[4], pns[5], pns[12], pns[16], pns[17], pns[18]}, packets.Acked)
-	require.Equal(t, []protocol.PacketNumber{pns[7], pns[8], pns[9], pns[10], pns[11], pns[13], pns[14], pns[15]}, packets.Lost)
+	// Packets 14 and 15 (reordering extents 4 and 3) are no longer declared
+	// lost: the spurious losses acknowledged by the previous ACK raised the
+	// adaptive reordering threshold to 1.25 * (16 - 1) = 18.75.
+	require.Equal(t, []protocol.PacketNumber{pns[7], pns[8], pns[9], pns[10], pns[11], pns[13]}, packets.Lost)
 
 	require.Equal(t,
 		[]qlogwriter.Event{

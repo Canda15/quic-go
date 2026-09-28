@@ -568,6 +568,28 @@ func (e SpuriousLoss) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	return h.err
 }
 
+// ReorderThresholdUpdated logs a change of the adaptive packet reordering
+// threshold (see RFC 9002, section 6.1.1), which is raised when spurious
+// losses caused by reordering are detected and decays back toward the fixed
+// threshold afterwards. It is logged via the recovery:metrics_updated event.
+type ReorderThresholdUpdated struct {
+	Old float64
+	New float64
+}
+
+func (e ReorderThresholdUpdated) Name() string { return "recovery:metrics_updated" }
+
+func (e ReorderThresholdUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("reorder_threshold_old"))
+	h.WriteToken(jsontext.Float(e.Old))
+	h.WriteToken(jsontext.String("reorder_threshold_new"))
+	h.WriteToken(jsontext.Float(e.New))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 type KeyUpdated struct {
 	Trigger  KeyUpdateTrigger
 	KeyType  KeyType

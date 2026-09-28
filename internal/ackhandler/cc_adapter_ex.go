@@ -48,6 +48,12 @@ func (a *ccAdapterEx) OnCongestionEventEx(priorInFlight protocol.ByteCount, even
 	a.CC.OnCongestionEventEx(congestion.ByteCount(priorInFlight), eventTime, ackedPackets, lostPackets)
 }
 
+func (a *ccAdapterEx) OnSpuriousLoss(count int) {
+	if o, ok := a.CC.(congestion.SpuriousLossObserver); ok {
+		o.OnSpuriousLoss(count)
+	}
+}
+
 func (a *ccAdapterEx) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	a.CC.OnRetransmissionTimeout(packetsRetransmitted)
 }
