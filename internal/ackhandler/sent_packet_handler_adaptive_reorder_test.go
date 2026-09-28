@@ -293,3 +293,80 @@ func TestAdaptiveReorderThresholdCleanPath(t *testing.T) {
 	require.Equal(t, []protocol.PacketNumber{pns[10], pns[11]}, packets.Lost)
 	require.Equal(t, float64(packetThreshold), sph.reorderThreshold)
 }
+
+func TestAdaptiveTimeThresholdMapping(t *testing.T) {
+	// The default reordering threshold must map to exactly the default time
+	// threshold: the loss timing on unmodified paths depends on it.
+	require.Equal(t, timeThreshold, adaptiveTimeThreshold(packetThreshold))
+
+	// The raiseReorderThreshold scenario lifts the reordering threshold to
+	// 18.75, which maps to a multiplier of 1.145.
+	require.InDelta(t, 1.145, adaptiveTimeThreshold(18.75), 1e-9)
+
+	// The multiplier is capped at maxTimeThreshold, even for absurd reordering.
+	require.Equal(t, maxTimeThreshold, adaptiveTimeThreshold(maxReorderThreshold))
+	require.Equal(t, maxTimeThreshold, adaptiveTimeThreshold(1000*maxReorderThreshold))
+
+	// The mapping is monotonically non-decreasing.
+	prev := adaptiveTimeThreshold(packetThreshold)
+	for rt := float64(packetThreshold) + 0.25; rt <= maxReorderThreshold; rt += 0.25 {
+		mult := adaptiveTimeThreshold(rt)
+		require.GreaterOrEqual(t, mult, prev)
+		prev = mult
+	}
+}
+
+func TestAdaptiveTimeThresholdCoupling(t *testing.T) {
+	sph, packets, _ := newAdaptiveReorderTestHandler(t)
+
+	// Raise the reordering threshold to its cap, which maps the time threshold
+	// multiplier to exactly maxTimeThreshold (1.5).
+	sph.updateReorderThreshold(100000, monotime.Now())
+	require.Equal(t, float64(maxReorderThreshold), sph.reorderThreshold)
+
+	sendPacket := func(ti monotime.Time) protocol.PacketNumber {
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		return pn
+	}
+
+	// Establish an RTT of 1s.
+	start := monotime.Now()
+	pn0 := sendPacket(start)
+	_, err := sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pn0)},
+		protocol.Encryption1RTT,
+		start.Add(time.Second),
+	)
+	require.NoError(t, err)
+
+	// With the time threshold coupled to 1.5 RTTs, a packet that has been
+	// outstanding for 1.4 RTTs is not declared lost anymore - with the default
+	// 9/8 RTT threshold it would have been. The gap to the largest acked packet
+	// is 1, so only the time threshold is at play here.
+	pn1 := sendPacket(start.Add(time.Second))
+	pn2 := sendPacket(start.Add(time.Second + 400*time.Millisecond))
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pn2)},
+		protocol.Encryption1RTT,
+		start.Add(time.Second + 1400*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.Empty(t, packets.Lost)
+
+	// More than 1.5 RTTs after sending, packets are still declared lost by the
+	// time threshold.
+	pn3 := sendPacket(start.Add(time.Second + 1400*time.Millisecond))
+	pn4 := sendPacket(start.Add(time.Second + 1950*time.Millisecond))
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pn4)},
+		protocol.Encryption1RTT,
+		start.Add(time.Second + 2950*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []protocol.PacketNumber{pn1, pn3}, packets.Lost)
+
+	// The reordering threshold must not have decayed in the meantime, otherwise
+	// the assertions above would pass for the wrong reason.
+	require.Equal(t, float64(maxReorderThreshold), sph.reorderThreshold)
+}

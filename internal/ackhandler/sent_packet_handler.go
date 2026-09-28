@@ -22,6 +22,13 @@ const (
 	// Maximum reordering in time space before time based loss detection considers a packet lost.
 	// Specified as an RTT multiplier.
 	timeThreshold = 9.0 / 8
+	// Upper bound for the time threshold multiplier of the application data packet
+	// number space. An observed packet reordering extent cannot be translated into
+	// time without knowing the send rate, so the time threshold is not adapted
+	// directly, but coupled to the adaptive packet reordering threshold (see
+	// adaptiveTimeThreshold): paths that reorder deeply in packet space get extra
+	// headroom in time space as well.
+	maxTimeThreshold = 1.5
 	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
 	packetThreshold = 3
 	// Some paths reorder packets to a much higher degree than others. On such paths, a
@@ -612,6 +619,18 @@ type spuriousLossObserver interface {
 	OnSpuriousLoss(count int)
 }
 
+// adaptiveTimeThreshold couples the time threshold of the application data
+// packet number space to the adaptive packet reordering threshold: it maps the
+// reordering threshold linearly from packetThreshold to maxReorderThreshold onto
+// the multiplier range [timeThreshold, maxTimeThreshold]. The quantization is
+// applied to the increment above timeThreshold, so that a reordering threshold
+// of packetThreshold yields exactly the default 9/8.
+func adaptiveTimeThreshold(reorderThreshold float64) float64 {
+	frac := (min(reorderThreshold, maxReorderThreshold) - packetThreshold) / (maxReorderThreshold - packetThreshold)
+	inc := (maxTimeThreshold - timeThreshold) * frac
+	return min(maxTimeThreshold, timeThreshold+math.Round(inc*100)/100)
+}
+
 // updateReorderThreshold raises the adaptive reordering threshold of the
 // application data packet number space, see RFC 9002 section 6.1.1: paths that
 // reorder packets to a higher degree than the current threshold would keep
@@ -929,6 +948,12 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
 	lossDelay := time.Duration(timeThreshold * maxRTT)
+	// The application data packet number space additionally raises the time
+	// threshold along with the adaptive reordering threshold (see
+	// adaptiveTimeThreshold), all other spaces use the fixed one.
+	if encLevel == protocol.Encryption1RTT {
+		lossDelay = time.Duration(adaptiveTimeThreshold(h.reorderThreshold) * maxRTT)
+	}
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)
